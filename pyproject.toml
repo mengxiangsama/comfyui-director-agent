@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-director-agent"
+version = "0.1.0"
+description = "Chinese creative brief to detailed prompts, multi-machine assignments, and a composited final image or video."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "LICENSES/*.txt"]
+dependencies = ["httpx[socks]>=0.27,<1", "pydantic>=2.9,<3", "Pillow>=11,<13", "filelock>=3.16,<4", "fonttools>=4.55,<5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.9,<1", "build>=1.2,<2"]
+cutout = ["rembg[cpu]>=2.0.60,<3"]
+
+[project.scripts]
+comfy-director = "comfyui_director.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.setuptools.package-data]
+"comfyui_director.data" = ["*.json"]

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+runs/
+demo-output/
+dist/
+build/
+comfyui_director_agent-*/
+*.log
+.DS_Store
+cluster.local.json

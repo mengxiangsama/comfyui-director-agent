@@ -1,0 +1,161 @@
+{
+  "workers": [
+    {
+      "id": "gpu-a",
+      "url": "http://192.168.1.101:8188",
+      "roles": [
+        "background",
+        "foreground"
+      ],
+      "capacity": 1
+    },
+    {
+      "id": "gpu-b",
+      "url": "http://192.168.1.102:8188",
+      "roles": [
+        "background",
+        "foreground"
+      ],
+      "capacity": 1
+    },
+    {
+      "id": "gpu-c",
+      "url": "http://192.168.1.103:8188",
+      "roles": [
+        "foreground",
+        "video"
+      ],
+      "capacity": 1
+    }
+  ],
+  "profiles": {
+    "background": {
+      "file": "workflows/sdxl-image.api.json",
+      "bindings": {
+        "prompt": [
+          "6",
+          "text"
+        ],
+        "negative": [
+          "7",
+          "text"
+        ],
+        "width": [
+          "5",
+          "width"
+        ],
+        "height": [
+          "5",
+          "height"
+        ],
+        "seed": [
+          "3",
+          "seed"
+        ],
+        "checkpoint": [
+          "4",
+          "ckpt_name"
+        ]
+      },
+      "outputs": {
+        "image": {
+          "node": "9",
+          "field": "images",
+          "index": 0
+        }
+      },
+      "defaults": {
+        "checkpoint": "sd_xl_base_1.0.safetensors"
+      }
+    },
+    "foreground": {
+      "file": "workflows/sdxl-image.api.json",
+      "bindings": {
+        "prompt": [
+          "6",
+          "text"
+        ],
+        "negative": [
+          "7",
+          "text"
+        ],
+        "width": [
+          "5",
+          "width"
+        ],
+        "height": [
+          "5",
+          "height"
+        ],
+        "seed": [
+          "3",
+          "seed"
+        ],
+        "checkpoint": [
+          "4",
+          "ckpt_name"
+        ]
+      },
+      "outputs": {
+        "image": {
+          "node": "9",
+          "field": "images",
+          "index": 0
+        }
+      },
+      "defaults": {
+        "checkpoint": "sd_xl_base_1.0.safetensors"
+      }
+    },
+    "video": {
+      "file": "workflows/wan22-i2v.api.json",
+      "bindings": {
+        "prompt": [
+          "6",
+          "text"
+        ],
+        "negative": [
+          "7",
+          "text"
+        ],
+        "width": [
+          "55",
+          "width"
+        ],
+        "height": [
+          "55",
+          "height"
+        ],
+        "frames": [
+          "55",
+          "length"
+        ],
+        "fps": [
+          "57",
+          "fps"
+        ],
+        "seed": [
+          "3",
+          "seed"
+        ],
+        "image": [
+          "56",
+          "image"
+        ]
+      },
+      "outputs": {
+        "video": {
+          "node": "58",
+          "field": "images",
+          "index": 0
+        }
+      },
+      "defaults": {}
+    }
+  },
+  "foreground_cutout": "rembg",
+  "font_file": "fonts/NotoSansCJK-Regular.ttc",
+  "poll_interval_seconds": 2,
+  "task_timeout_seconds": 1800,
+  "max_artifact_mb": 256
+}
