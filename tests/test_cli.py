@@ -2,6 +2,7 @@ import json
 from importlib.resources import files
 
 import pytest
+from PIL import Image, ImageChops
 
 from comfyui_director import cli
 from comfyui_director.models import ClusterConfig, CreativePlan
@@ -45,6 +46,25 @@ def test_plan_calls_provider_then_exports_validated_json_and_markdown(tmp_path, 
     assert CreativePlan.model_validate_json(path.read_text()).request == request
     assert path.with_suffix(".md").exists()
     assert "test-secret" not in path.read_text()
+
+
+def test_cli_demo_materials_can_be_recomposed_offline(tmp_path, monkeypatch):
+    async def unexpected_remote_call(*args, **kwargs):
+        pytest.fail("offline composition must not call an LLM or a ComfyUI worker")
+
+    monkeypatch.setattr(cli, "generate_plan", unexpected_remote_call)
+    monkeypatch.setattr(cli.Runner, "run", unexpected_remote_call)
+    demo = tmp_path / "demo"
+    assert cli.main(["demo", "--compose", "--out-dir", str(demo)]) == 0
+    original = CreativePlan.model_validate_json((demo / "demo-plan.json").read_text())
+    adjusted = original.model_copy(update={"placement": original.placement.model_copy(update={"x": 470})})
+    plan = tmp_path / "adjusted-plan.json"
+    plan.write_text(adjusted.model_dump_json())
+    final = tmp_path / "recomposed.png"
+    assert cli.main(["compose", str(plan), "--run-dir", str(demo / "run"), "--out", str(final)]) == 0
+    with Image.open(final) as updated, Image.open(demo / "final.png") as initial:
+        assert updated.size == (original.canvas.width, original.canvas.height)
+        assert ImageChops.difference(updated, initial).getbbox() is not None
 
 
 def test_missing_model_configuration_fails_without_execution(monkeypatch, capsys):

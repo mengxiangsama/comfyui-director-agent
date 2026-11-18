@@ -25,6 +25,17 @@ class SubmissionUncertain(ComfyError):
     """Submission may have reached ComfyUI; verify its queue before resubmitting."""
 
 
+class ComfyExecutionFailed(ComfyError):
+    """ComfyUI history confirms that a submitted job reached a terminal failure."""
+
+
+_MODEL_FIELDS = frozenset({
+    "ckpt_name", "unet_name", "clip_name", "clip_name1", "clip_name2", "clip_name3",
+    "vae_name", "lora_name", "control_net_name", "model_name", "style_model_name",
+    "upscale_model_name", "clip_vision_name", "gligen_name", "diffusion_model_name",
+})
+
+
 def _relative_name(value: Any, *, allow_folder: bool = False) -> str:
     """Accept only ComfyUI-relative artifact identifiers, never filesystem paths."""
     if not isinstance(value, str) or "\x00" in value or "\\" in value:
@@ -89,14 +100,7 @@ class ComfyClient:
             raise ComfyError("Worker returned an invalid health response.")
         return data
 
-    async def validate_workflow(self, workflow: dict) -> None:
-        if not isinstance(workflow, dict) or not workflow:
-            raise ComfyError("Workflow must be a nonempty ComfyUI API-format object.")
-        required: set[str] = set()
-        for node in workflow.values():
-            if not isinstance(node, dict) or not isinstance(node.get("class_type"), str):
-                raise ComfyError("Workflow must use ComfyUI API format, not editor format.")
-            required.add(node["class_type"])
+    async def object_info(self) -> dict:
         try:
             response = await self._client.get("object_info")
             response.raise_for_status()
@@ -105,9 +109,55 @@ class ComfyClient:
             raise ComfyError("Could not read worker node capabilities.") from None
         if not isinstance(available, dict):
             raise ComfyError("Worker returned invalid node capabilities.")
-        if required.difference(available):
-            # Missing names are local workflow data; avoid echoing worker response bodies.
-            raise ComfyError("Worker is missing node classes required by the workflow.")
+        return available
+
+    async def validate_workflow(self, workflow: dict, *, node_info: dict | None = None) -> None:
+        if not isinstance(workflow, dict) or not workflow:
+            raise ComfyError("Workflow must be a nonempty ComfyUI API-format object.")
+        for node in workflow.values():
+            if (not isinstance(node, dict) or not isinstance(node.get("class_type"), str)
+                    or not isinstance(node.get("inputs"), dict)):
+                raise ComfyError("Workflow must use ComfyUI API format, not editor format.")
+        if node_info is None:
+            node_info = await self.object_info()
+        missing = sorted({node["class_type"] for node in workflow.values()} - node_info.keys())
+        if missing:
+            raise ComfyError("Worker is missing node classes: " + ", ".join(missing))
+
+        problems = []
+        for node_id, node in workflow.items():
+            node_type = node["class_type"]
+            schema = node_info.get(node_type)
+            fields = schema.get("input", {}) if isinstance(schema, dict) else {}
+            if not isinstance(fields, dict):
+                continue
+            values = node["inputs"]
+            for group in ("required", "optional"):
+                declared = fields.get(group, {})
+                if not isinstance(declared, dict):
+                    continue
+                for name, definition in declared.items():
+                    if name not in values:
+                        if group == "required":
+                            problems.append(f"{node_type}[{node_id}] is missing required input {name}")
+                        continue
+                    if not isinstance(definition, list) or not definition:
+                        continue
+                    kind = definition[0]
+                    options = definition[1] if len(definition) > 1 and isinstance(definition[1], dict) else {}
+                    # Upload-driven choices are populated at runtime. Dynamic input
+                    # groups and graph links are validated by the worker on submission.
+                    if any(options.get(key) for key in ("image_upload", "video_upload", "audio_upload", "remote")):
+                        continue
+                    if node_type == "LoadImage" and name == "image":
+                        continue
+                    choices = kind if isinstance(kind, list) else options.get("options") if kind == "COMBO" else None
+                    value = values[name]
+                    if isinstance(choices, list) and isinstance(value, (str, int, float, bool)) and value not in choices:
+                        detail = f" {value!r}" if name in _MODEL_FIELDS else ""
+                        problems.append(f"{node_type}[{node_id}] has unavailable {name}{detail}")
+        if problems:
+            raise ComfyError("; ".join(problems))
 
     async def submit(self, workflow: dict, client_id: str) -> str:
         try:
@@ -118,7 +168,7 @@ class ComfyClient:
             raise SubmissionUncertain(
                 "Worker submission response was lost. Check its queue/history before resubmitting."
             ) from None
-        if 400 <= response.status_code < 500:
+        if 400 <= response.status_code < 500 and response.status_code != 408:
             raise ComfyError(f"Worker rejected workflow submission (HTTP {response.status_code}).")
         if not 200 <= response.status_code < 300:
             raise SubmissionUncertain(
@@ -188,9 +238,9 @@ class ComfyClient:
                         and message
                         and message[0] in ("execution_error", "execution_interrupted")
                     ):
-                        raise ComfyError("Worker workflow execution failed or was interrupted.")
+                        raise ComfyExecutionFailed("Worker workflow execution failed or was interrupted.")
                 if status.get("status_str") in ("error", "failed", "interrupted"):
-                    raise ComfyError("Worker workflow execution failed or was interrupted.")
+                    raise ComfyExecutionFailed("Worker workflow execution failed or was interrupted.")
                 if status.get("completed") is True:
                     return entry
             await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))

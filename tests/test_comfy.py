@@ -121,6 +121,7 @@ async def test_submit_timeout_never_retries_and_hides_secrets():
     ("status", "body", "error"),
     [
         (400, {"error": "credential-leak"}, ComfyError),
+        (408, {"error": "credential-leak"}, SubmissionUncertain),
         (500, {"error": "credential-leak"}, SubmissionUncertain),
         (200, {}, SubmissionUncertain),
         (200, {"error": "credential-leak"}, ComfyError),
@@ -152,6 +153,32 @@ async def test_validate_workflow_checks_node_classes():
             await client.validate_workflow({"9": {"class_type": "AbsentNode", "inputs": {}}})
         with pytest.raises(ComfyError, match="editor format"):
             await client.validate_workflow({"nodes": []})
+
+
+async def test_validate_workflow_checks_legacy_and_new_model_choices_and_skips_uploads():
+    metadata = {
+        "UNETLoader": {"input": {"required": {"unet_name": [["other.safetensors"]]}}},
+        "VAELoader": {"input": {"required": {"vae_name": ["COMBO", {"options": ["other_vae.safetensors"]}]}}},
+        "LoadImage": {"input": {"required": {"image": [["old-upload.png"]]}}},
+        "Processor": {"input": {"required": {"image": ["IMAGE"]}}},
+    }
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "target.safetensors"}},
+        "2": {"class_type": "VAELoader", "inputs": {"vae_name": "target_vae.safetensors"}},
+        "3": {"class_type": "LoadImage", "inputs": {"image": "upload-later.png"}},
+        "4": {"class_type": "Processor", "inputs": {}},
+    }
+    async with ComfyClient("http://worker") as client:
+        with pytest.raises(ComfyError) as error:
+            await client.validate_workflow(graph, node_info=metadata)
+        assert "UNETLoader[1] has unavailable unet_name 'target.safetensors'" in str(error.value)
+        assert "VAELoader[2] has unavailable vae_name 'target_vae.safetensors'" in str(error.value)
+        assert "Processor[4] is missing required input image" in str(error.value)
+        assert "upload-later.png" not in str(error.value)
+        graph["1"]["inputs"]["unet_name"] = "other.safetensors"
+        graph["2"]["inputs"]["vae_name"] = "other_vae.safetensors"
+        graph["4"]["inputs"]["image"] = ["3", 0]
+        await client.validate_workflow(graph, node_info=metadata)
 
 
 async def test_upload_uses_unique_name_and_preserves_returned_subfolder(tmp_path):

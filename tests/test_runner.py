@@ -1,10 +1,12 @@
 import asyncio
 import io
 import json
+import threading
 from collections import Counter
 
 import httpx
 import pytest
+from filelock import FileLock, Timeout
 from PIL import Image
 
 from comfyui_director.comfy import ComfyClient
@@ -220,6 +222,59 @@ class WorkerPool:
         raise AssertionError(f"Unexpected worker request: {request.method} {path}")
 
 
+class RecordingPool(WorkerPool):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.requests = []
+        self.payloads = []
+        self.failure_tasks = set()
+        self.reject_tasks = set()
+        self.download_failures = set()
+        self.history_pending = set()
+        self.node_infos = {}
+
+    async def handle(self, request):
+        self.requests.append((request.url.host, request.method, request.url.path))
+        if request.url.path == "/prompt":
+            body = json.loads(request.content)
+            self.payloads.append(body)
+            task = body["prompt"]["1"]["inputs"]["text"]
+            if task in self.reject_tasks:
+                return httpx.Response(400, json={"error": "private remote detail"})
+        if request.url.path == "/object_info" and request.url.host in self.node_infos:
+            return httpx.Response(200, json=self.node_infos[request.url.host])
+        if request.url.path.startswith("/history/"):
+            prompt_id = request.url.path.rsplit("/", 1)[1]
+            if self.tasks[prompt_id][1] in self.history_pending:
+                return httpx.Response(200, json={})
+        if request.url.path == "/view":
+            prompt_id = request.url.params["filename"].rsplit(".", 1)[0]
+            if self.tasks[prompt_id][1] in self.download_failures:
+                return httpx.Response(503, text="private remote detail")
+        response = await super().handle(request)
+        if request.url.path.startswith("/history/"):
+            prompt_id = request.url.path.rsplit("/", 1)[1]
+            if self.tasks[prompt_id][1] in self.failure_tasks:
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "status": {
+                                "status_str": "error",
+                                "messages": [
+                                    ["execution_error", {"detail": "private remote detail"}]
+                                ],
+                            }
+                        }
+                    },
+                )
+        return response
+
+
+def journal(run_dir):
+    return json.loads((run_dir / "run.json").read_text())
+
+
 async def test_three_workers_parallel_layers_and_final_composition_barrier(tmp_path):
     config = make_config(tmp_path)
     pool = WorkerPool()
@@ -399,3 +454,360 @@ async def test_wan_incompatible_dimensions_or_frames_fail_before_gpu_tasks(
     with pytest.raises(RunError, match="divisible by 32 and frames=4n"):
         await Runner(config, tmp_path, client_factory=pool.client).run(plan, tmp_path / "run")
     assert pool.submissions == []
+
+
+async def test_confirmed_failure_has_terminal_state_and_explicit_single_task_retry(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(extras=1), RecordingPool()
+    pool.failure_tasks.add("foreground")
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError, match="--retry foreground"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    old = journal(run_dir)
+    record = old["tasks"]["foreground"]
+    assert record["state"] == "failed"
+    assert record["error_code"] == "execution_failed"
+    assert "private remote detail" not in json.dumps(old)
+    count = len(pool.requests)
+    with pytest.raises(RunError, match="--retry foreground"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert len(pool.requests) == count
+    pool.failure_tasks.clear()
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(
+        plan,
+        run_dir,
+        retry_tasks=("foreground",),
+    )
+    current = state["tasks"]["foreground"]
+    assert state["state"] == "completed"
+    assert current["seed"] == record["seed"]
+    assert current["prompt_id"] != record["prompt_id"]
+    assert current["attempt"] == 2
+    assert current["attempts"] == [
+        {
+            "state": "failed",
+            "worker": record["worker"],
+            "prompt_id": record["prompt_id"],
+            "seed": record["seed"],
+            "error_code": "execution_failed",
+            "attempt": 1,
+        }
+    ]
+    assert Counter(task for _, task, _ in pool.submissions) == {
+        "background": 1,
+        "foreground": 2,
+        "extra_0": 1,
+    }
+    seeds = [
+        item["prompt"]["1"]["inputs"]["seed"]
+        for item in pool.payloads
+        if item["prompt"]["1"]["inputs"]["text"] == "foreground"
+    ]
+    assert seeds == [record["seed"], record["seed"]]
+    assert old["fingerprint"] == state["fingerprint"]
+
+
+async def test_rejected_submission_can_be_explicitly_retried(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    pool.reject_tasks.add("foreground")
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError, match="--retry foreground"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    rejected = journal(run_dir)["tasks"]["foreground"]
+    assert rejected["state"] == "rejected"
+    assert "prompt_id" not in rejected
+    pool.reject_tasks.clear()
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(
+        plan, run_dir, retry_tasks=("foreground",)
+    )
+    assert state["tasks"]["foreground"]["seed"] == rejected["seed"]
+    assert state["tasks"]["foreground"]["attempts"][0]["state"] == "rejected"
+    assert Counter(task for _, task, _ in pool.submissions) == {"background": 1, "foreground": 1}
+
+
+async def test_two_failed_layers_can_be_retried_individually(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(extras=1), RecordingPool()
+    pool.failure_tasks.update({"foreground", "extra_0"})
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    extra_before = journal(run_dir)["tasks"]["extra_0"]
+    pool.failure_tasks.clear()
+    with pytest.raises(RunError, match="--retry extra_0"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(
+            plan, run_dir, retry_tasks=("foreground",)
+        )
+    partial = journal(run_dir)
+    assert partial["tasks"]["foreground"]["state"] == "completed"
+    assert partial["tasks"]["extra_0"] == extra_before
+    assert not (run_dir / "final.png").exists()
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(
+        plan, run_dir, retry_tasks=("extra_0",)
+    )
+    assert state["state"] == "completed"
+    assert Counter(task for _, task, _ in pool.submissions) == {
+        "background": 1,
+        "foreground": 2,
+        "extra_0": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "state", ["completed", "submitted", "uncertain", "submitting", "downloading", "pending"]
+)
+async def test_retry_rejects_unconfirmed_or_successful_tasks_without_mutation(tmp_path, state):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    run_dir = tmp_path / "run"
+    await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    data = journal(run_dir)
+    data["tasks"]["foreground"]["state"] = state
+    if state in ("uncertain", "submitting", "pending"):
+        data["tasks"]["foreground"].pop("prompt_id", None)
+    path = run_dir / "run.json"
+    path.write_text(json.dumps(data))
+    before = path.read_bytes()
+    count = len(pool.requests)
+    with pytest.raises(RunError, match="cannot be retried"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(
+            plan, run_dir, retry_tasks=("foreground",)
+        )
+    assert path.read_bytes() == before
+    assert len(pool.requests) == count
+
+
+@pytest.mark.parametrize("tasks", [("foreground", "unknown"), ("foreground", "foreground")])
+async def test_retry_batch_validation_is_atomic(tmp_path, tasks):
+    config, plan, pool = (
+        make_config(tmp_path),
+        make_plan(),
+        RecordingPool(execution_error="foreground"),
+    )
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    path = run_dir / "run.json"
+    before = path.read_bytes()
+    with pytest.raises(RunError):
+        await Runner(config, tmp_path, client_factory=pool.client).run(
+            plan, run_dir, retry_tasks=tasks
+        )
+    assert path.read_bytes() == before
+    assert len(pool.submissions) == 2
+
+
+async def test_legacy_submitted_failure_is_confirmed_before_retry(tmp_path):
+    config, plan, pool = (
+        make_config(tmp_path),
+        make_plan(),
+        RecordingPool(execution_error="foreground"),
+    )
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    data = journal(run_dir)
+    record = data["tasks"]["foreground"]
+    record["state"] = "submitted"
+    record.pop("error_code")
+    record.pop("attempt")
+    (run_dir / "run.json").write_text(json.dumps(data))
+    with pytest.raises(RunError, match="cannot be retried"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(
+            plan, run_dir, retry_tasks=("foreground",)
+        )
+    with pytest.raises(RunError, match="--retry foreground"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert journal(run_dir)["tasks"]["foreground"]["state"] == "failed"
+    pool.execution_error = None
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(
+        plan, run_dir, retry_tasks=("foreground",)
+    )
+    assert state["state"] == "completed"
+    assert state["tasks"]["foreground"]["attempt"] == 2
+
+
+async def test_poll_timeout_is_not_a_retryable_execution_failure(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    pool.history_pending.add("foreground")
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError, match="Task foreground"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert journal(run_dir)["tasks"]["foreground"]["state"] == "submitted"
+    with pytest.raises(RunError, match="cannot be retried"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(
+            plan, run_dir, retry_tasks=("foreground",)
+        )
+    pool.history_pending.clear()
+    await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert len(pool.submissions) == 2
+
+
+async def test_download_failure_resumes_same_prompt_without_rerender(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    pool.download_failures.add("foreground")
+    run_dir = tmp_path / "run"
+    with pytest.raises(RunError, match="Task foreground"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    record = journal(run_dir)["tasks"]["foreground"]
+    assert record["state"] == "downloading"
+    with pytest.raises(RunError, match="cannot be retried"):
+        await Runner(config, tmp_path, client_factory=pool.client).run(
+            plan, run_dir, retry_tasks=("foreground",)
+        )
+    pool.download_failures.clear()
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert state["tasks"]["foreground"]["prompt_id"] == record["prompt_id"]
+    assert len(pool.submissions) == 2
+
+
+@pytest.mark.parametrize("legacy,valid_image", [(False, False), (True, False), (False, True)])
+async def test_corrupt_cached_image_is_redownloaded_using_original_prompt(
+    tmp_path, legacy, valid_image
+):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    run_dir = tmp_path / "run"
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    record = state["tasks"]["foreground"]
+    path = run_dir / record["outputs"]["image"]
+    original = path.read_bytes()
+    path.write_bytes(png((0, 255, 0, 255), alpha=True) if valid_image else b"truncated PNG")
+    if legacy:
+        for item in state["tasks"].values():
+            item.pop("artifact_integrity", None)
+        (run_dir / "run.json").write_text(json.dumps(state))
+    old_views = sum(url == "/view" for _, _, url in pool.requests)
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert path.read_bytes() == original
+    assert state["tasks"]["foreground"]["prompt_id"] == record["prompt_id"]
+    assert sum(url == "/view" for _, _, url in pool.requests) == old_views + 1
+    assert len(pool.submissions) == 2
+
+
+async def test_cancellation_holds_run_lock_until_local_writer_finishes(tmp_path, monkeypatch):
+    import comfyui_director.runner as module
+
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original = module.compose
+
+    def slow_compose(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(module, "compose", slow_compose)
+    run_dir = tmp_path / "run"
+    task = asyncio.create_task(
+        Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert not task.done()
+        with pytest.raises(Timeout):
+            FileLock(run_dir / ".lock").acquire(timeout=0)
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+    lock = FileLock(run_dir / ".lock")
+    with lock.acquire(timeout=0):
+        assert journal(run_dir)["state"] == "needs_attention"
+    monkeypatch.setattr(module, "compose", original)
+    assert (await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir))[
+        "state"
+    ] == "completed"
+    assert len(pool.submissions) == 2
+
+
+async def test_pending_task_can_choose_another_worker_before_submission(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    run_dir = tmp_path / "run"
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    record = state["tasks"]["foreground"]
+    old_worker = record["worker"]
+    record.update(state="pending")
+    for key in ("prompt_id", "outputs", "artifact_integrity"):
+        record.pop(key)
+    (run_dir / "run.json").write_text(json.dumps(state))
+    pool.offline.add(
+        next(w.url.removeprefix("http://") for w in config.workers if w.id == old_worker)
+    )
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert state["tasks"]["foreground"]["worker"] != old_worker
+
+
+async def test_known_prompt_resume_does_not_require_current_model_capabilities(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    run_dir = tmp_path / "run"
+    state = await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    record = state["tasks"]["foreground"]
+    (run_dir / record["outputs"]["image"]).unlink()
+    for worker in config.workers:
+        pool.node_infos[worker.url.removeprefix("http://")] = {}
+    pool.requests.clear()
+    await Runner(config, tmp_path, client_factory=pool.client).run(plan, run_dir)
+    assert not any(
+        path in ("/object_info", "/system_stats", "/prompt") for _, _, path in pool.requests
+    )
+    assert any(path == f"/history/{record['prompt_id']}" for _, _, path in pool.requests)
+
+
+@pytest.mark.parametrize("error", ["credentials", "invalid_url"])
+async def test_one_client_initialization_failure_does_not_block_other_workers(tmp_path, error):
+    from comfyui_director.comfy import ComfyError
+
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+
+    def factory(worker):
+        if worker.id == "w0":
+            if error == "credentials":
+                raise ComfyError("Worker auth environment variable is not set: TEST_KEY")
+            raise ValueError("private invalid URL detail")
+        return pool.client(worker)
+
+    state = await Runner(config, tmp_path, client_factory=factory).run(plan, tmp_path / "run")
+    assert state["state"] == "completed"
+    assert "worker-0" not in {host for host, _, _ in pool.submissions}
+
+
+async def test_unused_video_worker_is_not_initialized_for_image_plan(tmp_path):
+    config, plan, pool = make_config(tmp_path, video=True), make_plan(), RecordingPool()
+    payload = config.model_dump()
+    payload["workers"].append({"id": "video_only", "url": "http://video-only", "roles": ["video"]})
+    config = ClusterConfig.model_validate(payload)
+
+    def factory(worker):
+        assert worker.id != "video_only"
+        return pool.client(worker)
+
+    await Runner(config, tmp_path, client_factory=factory).run(plan, tmp_path / "run")
+
+
+async def test_static_model_diagnostics_use_bound_profile_defaults(tmp_path):
+    config, plan, pool = make_config(tmp_path), make_plan(), RecordingPool()
+    graph_path = tmp_path / "image.json"
+    graph = json.loads(graph_path.read_text())
+    graph["1"]["inputs"]["ckpt_name"] = "placeholder"
+    graph_path.write_text(json.dumps(graph))
+    for profile in config.profiles.values():
+        profile.bindings["checkpoint"] = ("1", "ckpt_name")
+        profile.defaults["checkpoint"] = "correct.safetensors"
+    for index in range(3):
+        pool.node_infos[f"worker-{index}"] = {
+            "GenerateImage": {
+                "input": {
+                    "required": {
+                        "ckpt_name": [
+                            ["missing.safetensors" if index == 0 else "correct.safetensors"]
+                        ]
+                    }
+                }
+            },
+            "SaveImage": {},
+        }
+    await Runner(config, tmp_path, client_factory=pool.client).run(plan, tmp_path / "run")
+    assert "worker-0" not in {host for host, _, _ in pool.submissions}

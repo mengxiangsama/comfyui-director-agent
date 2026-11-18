@@ -21,3 +21,4 @@ jobs:
       - run: pytest -q
       - run: python -m build
       - run: comfy-director demo --out-dir /tmp/director-demo --medium multi
+      - run: comfy-director demo --compose --out-dir /tmp/director-compose-demo

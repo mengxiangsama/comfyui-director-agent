@@ -18,8 +18,10 @@ Agent 会给出详细的中英文提示词、共同画风和光照约定、背�
 |---|---|---|
 | 中文需求变成详细提示词 | 安装 Agent Skill，直接对 Codex 说需求 | 你正在使用的 Agent |
 | 得到可执行的 JSON 计划 | 让 Agent 按计划格式输出，或用 `plan` 命令 | Agent；用 `plan` 时另需兼容 LLM API |
-| 先看完整人工示例 | `demo` | Python；无需 ComfyUI、GPU 或 LLM API |
+| 看素材如何合成成品 | `demo --compose` | Python 和 Pillow 即可 |
+| 导出完整人工计划 | `demo` | Python 即可 |
 | N 台机器分工出图、最后合成 | `run` | 可访问的 ComfyUI 机器池、匹配的工作流和模型 |
+| 调整现有图层和文字 | `compose` | 已下载的素材，有文字时需可用字体 |
 | 合成图继续生成视频 | 带 `video` 的计划 + 视频工作流配置 | 支持该图生视频工作流的 ComfyUI |
 
 Skill 可以由 Codex 本身理解需求并生成计划，**不需要为本项目单独配置另一个 LLM API**。命令行的 `plan` 是另一条入口，适合脚本调用，需要你自行配置兼容接口。
@@ -69,7 +71,19 @@ cp -R skills/comfyui-director ~/.codex/skills/
 
 只生成提示词时，无需启动 ComfyUI。技能默认允许自动发现，也可以用 `$comfyui-director` 显式调用。它能指导其他支持 Markdown 指令的 Agent；不同产品的安装目录以其实际配置为准。
 
-## 先看无需 GPU 的计划示例
+## 试跑免 GPU 合成演示
+
+| 背景 | 透明前景 | 合成成品 |
+| :---: | :---: | :---: |
+| <img src="assets/compose-demo/background.png" alt="演示背景" width="240"> | <img src="assets/compose-demo/foreground.png" alt="透明机甲猫素材" width="160"> | <img src="assets/compose-demo/final.png" alt="机甲猫合成成片" width="240"> |
+
+```bash
+comfy-director demo --compose --out-dir demo-output/compose
+```
+
+命令会在本地绘制演示素材，再用项目的合成流程生成 `demo-output/compose/final.png`。首次使用可以直接试跑这一步，看看透明前景如何与背景合成，无需 GPU、ComfyUI 或模型下载。
+
+## 导出计划示例
 
 ```bash
 comfy-director demo --out-dir demo-output
@@ -98,6 +112,13 @@ JSON 示例经过计划模型校验，不能据此推断真实 GPU 工作流已�
 ```bash
 comfy-director plan '雨夜赛博朋克城市里橙色机甲猫，竖版海报，标题《夜行计划》' --out plan.json
 comfy-director report plan.json --out plan.md
+```
+
+标题、价格等文案可以用 `--exact-text` 锁定，多个文字层重复传入。规划器会检查返回的文字，缺失或改字时要求模型修复一次。
+
+```bash
+comfy-director plan '生成护肤品海报，标题和价格单独排版' \
+  --exact-text '春日修护' --exact-text '30 mL / ¥199' --out plan.json
 ```
 
 如果希望规划时考虑机器数量，可以加 `--machines`：
@@ -145,11 +166,14 @@ cp cluster.example.json cluster.local.json
 
 示例中的模型文件名与工作流只是起点，需要按本机文件调整。项目不随包分发模型权重、中文字体或第三方自定义节点。
 
-执行人工编写的示例计划：
+检查配置，再运行人工编写的示例计划：
 
 ```bash
+comfy-director doctor --config cluster.local.json --plan examples/poster-plan.json
 comfy-director run examples/poster-plan.json --config cluster.local.json --run-dir runs/poster
 ```
+
+`doctor` 会按机器和角色报告节点、工作流必填项、模型缺项和本地依赖。指定 `--plan` 可同时检查这份计划的字体和视频条件。它只查询节点接口，适合在提交生成任务前排查环境。
 
 背景、主要前景和附加前景会作为独立任务提交给机器池，可用容量允许时并行。素材完成后，运行本工具的电脑用 Pillow 缩放、定位、应用透明度或遮罩，按图层顺序合成并排版文字。合成不需要另外准备 GPU，运行工具的电脑也可以是其中一台出图机器。
 
@@ -171,11 +195,27 @@ comfy-director run examples/video-plan.json --config cluster.local.json --run-di
 
 正常图片结果为运行目录中的 `final.png`，`scene.png` 是无字合成底图；有视频时另有 `final.mp4` 或对应视频格式。同一个运行目录用于恢复同一计划时，会依据已记录的任务 ID 处理已有任务；改变计划或配置时使用新目录。网络超时后应先核对 ComfyUI 队列与历史，避免重复提交。
 
+如果 ComfyUI 已明确报告前景任务失败，排查节点或模型后，可以只重试该层，保留其他图层的成品素材。额外图层用计划里的 `id` 指定，多个失败任务可以重复传 `--retry`。
+
+```bash
+comfy-director run examples/poster-plan.json --config cluster.local.json \
+  --run-dir runs/poster --retry foreground
+```
+
+改位置、尺寸、图层顺序或文字时，复制计划到 `plan-v2.json` 进行编辑，再用已下载的素材离线重合成。`--out` 指向原运行目录之外的 PNG 文件，有文字层时用 `--font-file` 传入字体。
+
+```bash
+comfy-director compose plan-v2.json --run-dir runs/poster \
+  --font-file fonts/NotoSansCJK-Regular.ttc --cutout rembg --out poster-v2.png
+```
+
+直接用已有透明前景或遮罩时，可省略 `--cutout rembg`。`compose` 复用素材并生成新图片，适合排版调整。
+
 需要检查的实际画面包括：主体完整性、抠图边缘、大小和落点、光照与透视一致性、标题字形、视频中的形变。计划中的 `acceptance` 是验收清单，不代表程序已经自动完成视觉评分或修复。
 
 更多机器可以处理更多独立素材，但传输、模型加载、抠图、合成和视频生成都有开销；只有两个生成任务时，加入更多机器也不会自动加速它们。第一版没有自动故障转移、跨机器共享显存、自动重试换模型或无限生成变体。
 
-`capacity` 只限制同一次 `run` 内的并发任务；同时启动多个运行目录时，没有跨进程的全局槽位配额。ComfyUI worker 请求默认直连配置地址，不继承系统 HTTP/SOCKS 代理。恢复时仍会检查相关 worker 是否可用；它不是一个离线素材管理器。
+`capacity` 只限制同一次 `run` 内的并发任务。ComfyUI worker 请求默认直连配置地址。恢复未下载的远端任务时需要访问原 worker，已下载的有效素材可以直接复用。
 
 当前交付状态：提供可安装 skill、计划结构、示例、命令行与可配置的执行链路。真实 ComfyUI、GPU 和视频工作流的联调情况以 [验证记录](docs/validation.md) 为准。
 

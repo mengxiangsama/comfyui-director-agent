@@ -7,7 +7,6 @@ import copy
 import hashlib
 import importlib.util
 import json
-import os
 import secrets
 import shutil
 import uuid
@@ -16,9 +15,11 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from filelock import FileLock, Timeout
+from PIL import Image
 
-from .comfy import ComfyClient, ComfyError, SubmissionUncertain
+from .comfy import ComfyClient, ComfyError, ComfyExecutionFailed, SubmissionUncertain
 from .compositor import add_typography, compose, overlay_video, typography_layer
+from .diagnostics import create_worker_client, probe_workers
 from .models import ClusterConfig, CreativePlan, PromptSpec, Worker, WorkflowProfile
 
 
@@ -68,13 +69,12 @@ class Runner:
         self.semaphores = {w.id: asyncio.Semaphore(w.capacity) for w in config.workers}
         self.queued = dict.fromkeys(self.workers, 0)
         self.eligible: dict[str, list[Worker]] = {}
-        self.graphs = {role: load_workflow(p, self.config_dir) for role, p in config.profiles.items()}
+        self.graphs = {
+            role: load_workflow(p, self.config_dir) for role, p in config.profiles.items()
+        }
 
     def _make_client(self, worker: Worker) -> ComfyClient:
-        key = os.environ.get(worker.api_key_env) if worker.api_key_env else None
-        if worker.api_key_env and not key:
-            raise RunError(f"Worker auth environment variable is not set: {worker.api_key_env}")
-        return ComfyClient(worker.url, api_key=key, max_artifact_mb=self.config.max_artifact_mb)
+        return create_worker_client(worker, self.config.max_artifact_mb)
 
     def _save(self):
         temporary = self.run_dir / "run.json.tmp"
@@ -88,62 +88,233 @@ class Runner:
             raise RunError("Journal artifact path escapes run directory")
         return path
 
-    async def _preflight(self, plan: CreativePlan):
+    @staticmethod
+    def _integrity(path: Path) -> dict:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+        return {"size": size, "sha256": digest.hexdigest()}
+
+    def _cached_outputs(self, task_id: str, role: str) -> dict[str, Path] | None:
+        record = self.state["tasks"].get(task_id, {})
+        if record.get("state") != "completed":
+            return None
+        outputs = record.get("outputs", {})
+        if not isinstance(outputs, dict) or set(outputs) != set(self.config.profiles[role].outputs):
+            return None
+        paths = {name: self._artifact(path) for name, path in outputs.items()}
+        saved = record.get("artifact_integrity", {})
+        observed = {}
+        try:
+            for name, path in paths.items():
+                if not path.is_file():
+                    return None
+                actual = self._integrity(path)
+                if not actual["size"]:
+                    return None
+                if name in saved:
+                    if actual != saved[name]:
+                        return None
+                elif name != "video":
+                    # Pre-checksum journals remain usable; validate legacy images
+                    # before recording their first integrity baseline.
+                    with Image.open(path) as image:
+                        image.verify()
+                observed[name] = actual
+        except (OSError, ValueError):
+            return None
+        self.cache_integrity[task_id] = observed
+        return paths
+
+    @staticmethod
+    async def _local_write(function: Callable, *args, **kwargs):
+        """Keep the run lock until an already-started filesystem writer stops."""
+        operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # Cancelling to_thread only cancels its waiter. Let the writer finish
+            # before run() releases its lock, including repeated Ctrl-C requests.
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if operation.done() and not operation.cancelled():
+                operation.exception()
+            raise
+
+    @staticmethod
+    def _task_roles(plan: CreativePlan) -> dict[str, str]:
+        roles = {"background": "background", "foreground": "foreground"}
+        roles.update((layer.id, "foreground") for layer in plan.extra_layers)
+        if plan.video:
+            roles["video"] = "video"
+        return roles
+
+    def _validate_retries(self, task_roles: dict[str, str], retry_tasks: tuple[str, ...]):
+        if len(set(retry_tasks)) != len(retry_tasks):
+            raise RunError("Each --retry task must be specified only once")
+        for task_id in retry_tasks:
+            if task_id not in task_roles or task_id not in self.state["tasks"]:
+                raise RunError(f"Unknown retry task: {task_id}")
+            state = self.state["tasks"][task_id].get("state")
+            if state not in ("failed", "rejected"):
+                raise RunError(
+                    f"Task {task_id} cannot be retried from state {state}; only confirmed failed/rejected tasks can be retried"
+                )
+        for task_id in task_roles:
+            record = self.state["tasks"].get(task_id, {})
+            if task_id in retry_tasks:
+                continue
+            state = record.get("state")
+            if state in ("submitting", "uncertain") and not record.get("prompt_id"):
+                raise RunError(
+                    f"Task {task_id} has an unconfirmed submission; check the worker queue/history manually"
+                )
+        failed = [
+            task_id
+            for task_id in task_roles
+            if self.state["tasks"].get(task_id, {}).get("state") in ("failed", "rejected")
+        ]
+        if failed and not retry_tasks:
+            flags = " ".join(f"--retry {task_id}" for task_id in failed)
+            raise RunError(
+                f"Tasks {', '.join(failed)} have confirmed failures; after correcting their causes, select one or more tasks using {flags}"
+            )
+
+    def _apply_retries(self, retry_tasks: tuple[str, ...]):
+        for task_id in retry_tasks:
+            record = self.state["tasks"][task_id]
+            summary = {
+                key: record[key]
+                for key in ("state", "worker", "prompt_id", "seed", "error_code")
+                if key in record
+            }
+            summary["attempt"] = record.get("attempt", 1)
+            record.setdefault("attempts", []).append(summary)
+            record["attempt"] = summary["attempt"] + 1
+            for key in ("worker", "prompt_id", "outputs", "artifact_integrity", "error_code"):
+                record.pop(key, None)
+            record["state"] = "pending"
+
+    async def _preflight(
+        self, plan: CreativePlan, submission_roles: set[str], unavailable: dict[str, str]
+    ):
         roles = ["background", "foreground"] + (["video"] if plan.video else [])
         if self.config.foreground_cutout == "rembg" and importlib.util.find_spec("rembg") is None:
-            raise RunError("Install the cutout extra or configure a foreground workflow with alpha/mask")
+            raise RunError(
+                "Install the cutout extra or configure a foreground workflow with alpha/mask"
+            )
         self.font = (self.config_dir / self.config.font_file) if self.config.font_file else None
         self.overlay = typography_layer(plan, self.font)
-        if plan.video and plan.text_layers and not all(shutil.which(p) for p in ("ffmpeg", "ffprobe")):
+        if (
+            plan.video
+            and plan.text_layers
+            and not all(shutil.which(p) for p in ("ffmpeg", "ffprobe"))
+        ):
             raise RunError("Video text overlay requires ffmpeg and ffprobe before GPU tasks start")
-        # Probe independently. One offline machine need not block other compatible machines.
-        health = await asyncio.gather(*(c.health() for c in self.clients.values()), return_exceptions=True)
-        healthy = {key for key, result in zip(self.clients, health, strict=True) if not isinstance(result, BaseException)}
+        workflows = {}
         for role in roles:
             if role not in self.graphs:
                 raise RunError(f"Missing workflow profile: {role}")
             profile = self.config.profiles[role]
-            if role == "video" and any(node["class_type"] == "Wan22ImageToVideoLatent" for node in self.graphs[role].values()):
+            if role == "video" and any(
+                node["class_type"] == "Wan22ImageToVideoLatent"
+                for node in self.graphs[role].values()
+            ):
                 if plan.canvas.width % 32 or plan.canvas.height % 32 or (plan.video.frames - 1) % 4:
-                    raise RunError("Wan2.2 profile requires canvas dimensions divisible by 32 and frames=4n+1")
+                    raise RunError(
+                        "Wan2.2 profile requires canvas dimensions divisible by 32 and frames=4n+1"
+                    )
             expected_output = "video" if role == "video" else "image"
             if expected_output not in profile.outputs:
                 raise RunError(f"Profile {role} must declare an output named {expected_output}")
-            if "prompt" not in profile.bindings or (role == "video" and "image" not in profile.bindings):
+            if "prompt" not in profile.bindings or (
+                role == "video" and "image" not in profile.bindings
+            ):
                 raise RunError(f"Profile {role} must bind prompt and, for video, image")
             # Verify binding names/defaults before submitting anything.
-            bind_workflow(self.graphs[role], profile, {
-                "prompt": "preflight", "negative": "", "width": plan.canvas.width,
-                "height": plan.canvas.height, "seed": 1, "image": "preflight.png",
-                "frames": plan.video.frames if plan.video else 1,
-                "fps": plan.video.fps if plan.video else 1,
-                "duration_seconds": plan.video.duration_seconds if plan.video else 1,
-            })
-            candidates = [w for w in self.config.workers if role in w.roles and w.id in healthy]
-            checks = await asyncio.gather(
-                *(self.clients[w.id].validate_workflow(self.graphs[role]) for w in candidates),
-                return_exceptions=True,
+            prompt = (
+                plan.video
+                if role == "video"
+                else plan.background
+                if role == "background"
+                else plan.foreground
             )
-            self.eligible[role] = [w for w, result in zip(candidates, checks, strict=True) if not isinstance(result, BaseException)]
+            workflows[role] = bind_workflow(
+                self.graphs[role],
+                profile,
+                {
+                    "prompt": prompt.positive_en,
+                    "negative": prompt.negative,
+                    "width": plan.canvas.width,
+                    "height": plan.canvas.height,
+                    "seed": 1,
+                    "image": "preflight.png",
+                    "frames": plan.video.frames if plan.video else 1,
+                    "fps": plan.video.fps if plan.video else 1,
+                    "duration_seconds": plan.video.duration_seconds if plan.video else 1,
+                },
+            )
+        checks = await probe_workers(
+            self.config,
+            self.clients,
+            workflows,
+            roles=submission_roles,
+            unavailable=unavailable,
+        )
+        for role in submission_roles:
+            valid = {row.worker_id for row in checks if row.role == role and row.ok}
+            self.eligible[role] = [worker for worker in self.config.workers if worker.id in valid]
             if not self.eligible[role]:
-                raise RunError(f"No healthy worker with required node classes for role: {role}")
+                detail = "; ".join(
+                    f"{row.worker_id}: {row.message}" for row in checks if row.role == role
+                )
+                raise RunError(
+                    f"No healthy worker with required capabilities for role {role}: {detail}"
+                )
 
     async def _generate(
-        self, task_id: str, role: str, prompt: PromptSpec, plan: CreativePlan, input_image: Path | None = None,
+        self,
+        task_id: str,
+        role: str,
+        prompt: PromptSpec,
+        plan: CreativePlan,
+        input_image: Path | None = None,
     ) -> dict[str, Path]:
-        record = self.state["tasks"].setdefault(task_id, {"state": "pending", "seed": secrets.randbelow(2**53)})
-        if record["state"] == "completed":
-            paths = {name: self._artifact(path) for name, path in record["outputs"].items()}
-            if all(path.is_file() for path in paths.values()):
-                return paths
+        record = self.state["tasks"].setdefault(
+            task_id, {"state": "pending", "seed": secrets.randbelow(2**53), "attempt": 1}
+        )
+        if task_id in self.cached:
+            record["artifact_integrity"] = self.cache_integrity[task_id]
+            return self.cached[task_id]
         if record["state"] in ("submitting", "uncertain") and not record.get("prompt_id"):
-            raise RunError(f"Task {task_id} has an unconfirmed submission; check the worker queue/history manually")
-        if record["state"] == "rejected":
-            raise RunError(f"Task {task_id} was rejected; fix the workflow and use a new run directory")
-        if record.get("worker"):
+            raise RunError(
+                f"Task {task_id} has an unconfirmed submission; check the worker queue/history manually"
+            )
+        if record["state"] in ("rejected", "failed"):
+            raise RunError(f"Task {task_id} is {record['state']}; resume with --retry {task_id}")
+        if record["state"] == "completed" and not record.get("prompt_id"):
+            raise RunError(
+                f"Task {task_id} has invalid cached artifacts but no prompt ID; inspect its journal"
+            )
+        if record.get("prompt_id"):
             worker = self.workers[record["worker"]]
+            if worker.id not in self.clients:
+                raise RunError(
+                    f"Task {task_id} must resume on its original worker {worker.id}; its client is unavailable"
+                )
         else:
-            worker = min(self.eligible[role], key=lambda w: self.queued[w.id] / w.capacity)
+            candidates = self.eligible[role]
+            worker = next((w for w in candidates if w.id == record.get("worker")), None)
+            if worker is None:
+                worker = min(candidates, key=lambda w: self.queued[w.id] / w.capacity)
             record["worker"] = worker.id
         self.queued[worker.id] += 1
         self._save()
@@ -152,32 +323,58 @@ class Runner:
                 client = self.clients[worker.id]
                 if not record.get("prompt_id"):
                     values = {
-                        "prompt": prompt.positive_en, "negative": prompt.negative,
-                        "width": plan.canvas.width, "height": plan.canvas.height, "seed": record["seed"],
+                        "prompt": prompt.positive_en,
+                        "negative": prompt.negative,
+                        "width": plan.canvas.width,
+                        "height": plan.canvas.height,
+                        "seed": record["seed"],
                     }
                     if plan.video and role == "video":
-                        values.update(frames=plan.video.frames, fps=plan.video.fps, duration_seconds=plan.video.duration_seconds)
+                        values.update(
+                            frames=plan.video.frames,
+                            fps=plan.video.fps,
+                            duration_seconds=plan.video.duration_seconds,
+                        )
                     if input_image is not None:
                         values["image"] = await client.upload(input_image)
                     workflow = bind_workflow(self.graphs[role], self.config.profiles[role], values)
                     record["state"] = "submitting"
                     self._save()
                     try:
-                        prompt_id = await client.submit(workflow, client_id=f"{self.state['run_id']}-{task_id}")
-                    except SubmissionUncertain:
-                        record["state"] = "uncertain"
+                        prompt_id = await client.submit(
+                            workflow, client_id=f"{self.state['run_id']}-{task_id}"
+                        )
+                    except SubmissionUncertain as exc:
+                        record.update(state="uncertain", error_code="submission_uncertain")
                         self._save()
-                        raise
+                        raise RunError(f"Task {task_id}: {exc}") from None
                     except ComfyError:
-                        record["state"] = "rejected"
+                        record.update(state="rejected", error_code="submission_rejected")
                         self._save()
-                        raise
+                        raise RunError(
+                            f"Task {task_id} was rejected; after correcting its cause, resume with --retry {task_id}"
+                        ) from None
                     record.update(state="submitted", prompt_id=prompt_id)
                     self._save()
-                entry = await client.wait(
-                    record["prompt_id"], poll_interval=self.config.poll_interval_seconds,
-                    timeout=self.config.task_timeout_seconds,
-                )
+                try:
+                    entry = await client.wait(
+                        record["prompt_id"],
+                        poll_interval=self.config.poll_interval_seconds,
+                        timeout=self.config.task_timeout_seconds,
+                    )
+                except ComfyExecutionFailed:
+                    record.update(state="failed", error_code="execution_failed")
+                    self._save()
+                    raise RunError(
+                        f"Task {task_id} failed on its worker; after correcting its cause, resume with --retry {task_id}"
+                    ) from None
+                except ComfyError as exc:
+                    raise RunError(
+                        f"Task {task_id}: {exc}; resume this run without --retry to keep its original prompt ID"
+                    ) from None
+                record.update(state="downloading")
+                record.pop("error_code", None)
+                self._save()
                 outputs: dict[str, Path] = {}
                 for name, selector in self.config.profiles[role].outputs.items():
                     if not name.isidentifier():
@@ -186,46 +383,142 @@ class Runner:
                         descriptor = entry["outputs"][selector.node][selector.field][selector.index]
                         suffix = Path(descriptor["filename"]).suffix.lower()
                     except (KeyError, IndexError, TypeError) as exc:
-                        raise RunError(f"Task {task_id} is missing its configured {name} artifact") from exc
-                    expected = {".mp4", ".webm", ".gif", ".mkv"} if name == "video" else {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+                        raise RunError(
+                            f"Task {task_id} is missing its configured {name} artifact"
+                        ) from exc
+                    expected = (
+                        {".mp4", ".webm", ".gif", ".mkv"}
+                        if name == "video"
+                        else {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+                    )
                     if suffix not in expected:
-                        raise RunError(f"Task {task_id} returned an unexpected artifact format for {name}")
+                        raise RunError(
+                            f"Task {task_id} returned an unexpected artifact format for {name}"
+                        )
                     destination = self.run_dir / "artifacts" / f"{task_id}-{name}{suffix}"
                     outputs[name] = await client.download(descriptor, destination)
-                record.update(state="completed", outputs={name: str(path.relative_to(self.run_dir)) for name, path in outputs.items()})
+                record.update(
+                    state="completed",
+                    outputs={
+                        name: str(path.relative_to(self.run_dir)) for name, path in outputs.items()
+                    },
+                    artifact_integrity={
+                        name: self._integrity(path) for name, path in outputs.items()
+                    },
+                )
                 self._save()
                 return outputs
+        except ComfyError as exc:
+            raise RunError(
+                f"Task {task_id}: {exc}; resume this run using its original prompt ID"
+            ) from None
         finally:
             self.queued[worker.id] -= 1
 
-    async def run(self, plan: CreativePlan, run_dir: Path) -> dict:
+    async def run(
+        self, plan: CreativePlan, run_dir: Path, *, retry_tasks: tuple[str, ...] = ()
+    ) -> dict:
         self.run_dir = Path(run_dir).resolve()
         self.run_dir.mkdir(parents=True, exist_ok=True)
         lock = FileLock(self.run_dir / ".lock")
+        started = False
         try:
             lock.acquire(timeout=0)
         except Timeout:
             raise RunError("This run directory is already in use") from None
         try:
-            payload = {"plan": plan.model_dump(), "config": self.config.model_dump(), "workflows": self.graphs}
+            payload = {
+                "plan": plan.model_dump(),
+                "config": self.config.model_dump(),
+                "workflows": self.graphs,
+            }
             fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             journal = self.run_dir / "run.json"
-            self.state = json.loads(journal.read_text(encoding="utf-8")) if journal.exists() else {
-                "run_id": uuid.uuid4().hex, "fingerprint": fingerprint, "state": "pending", "tasks": {},
-            }
+            self.state = (
+                json.loads(journal.read_text(encoding="utf-8"))
+                if journal.exists()
+                else {
+                    "run_id": uuid.uuid4().hex,
+                    "fingerprint": fingerprint,
+                    "state": "pending",
+                    "tasks": {},
+                }
+            )
             if self.state.get("fingerprint") != fingerprint:
                 raise RunError("Plan, configuration, or workflow changed; use a new run directory")
-            (self.run_dir / "plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+            task_roles = self._task_roles(plan)
+            self._validate_retries(task_roles, retry_tasks)
+            self.cache_integrity = {}
+            self.cached = {}
+            for task_id, role in task_roles.items():
+                paths = self._cached_outputs(task_id, role)
+                if paths is not None:
+                    self.cached[task_id] = paths
+            submission_roles = {
+                role
+                for task_id, role in task_roles.items()
+                if task_id not in self.cached
+                and (
+                    task_id in retry_tasks
+                    or self.state["tasks"].get(task_id, {}).get("state")
+                    not in ("failed", "rejected")
+                )
+                and (
+                    task_id in retry_tasks
+                    or not self.state["tasks"].get(task_id, {}).get("prompt_id")
+                )
+            }
+            pinned = {
+                record["worker"]
+                for task_id, record in self.state["tasks"].items()
+                if task_id in task_roles
+                and task_id not in self.cached
+                and task_id not in retry_tasks
+                and record.get("state") not in ("failed", "rejected")
+                and record.get("prompt_id")
+            }
+            (self.run_dir / "plan.json").write_text(
+                plan.model_dump_json(indent=2), encoding="utf-8"
+            )
             self._save()
             async with AsyncExitStack() as stack:
+                self.clients = {}
+                unavailable = {}
                 for worker in self.config.workers:
-                    self.clients[worker.id] = await stack.enter_async_context(self.client_factory(worker))
-                await self._preflight(plan)
+                    if worker.id not in pinned and not submission_roles.intersection(worker.roles):
+                        continue
+                    try:
+                        client = self.client_factory(worker)
+                        self.clients[worker.id] = await stack.enter_async_context(client)
+                    except ComfyError as exc:
+                        unavailable[worker.id] = str(exc)
+                    except ValueError:
+                        unavailable[worker.id] = "Worker URL or client configuration is invalid"
+                await self._preflight(plan, submission_roles, unavailable)
+                for task_id in task_roles:
+                    record = self.state["tasks"].get(task_id, {})
+                    if (
+                        task_id not in self.cached
+                        and task_id not in retry_tasks
+                        and record.get("state") not in ("failed", "rejected")
+                        and record.get("prompt_id")
+                        and record.get("worker") not in self.clients
+                    ):
+                        raise RunError(
+                            f"Task {task_id} must resume on original worker {record.get('worker')}: {unavailable.get(record.get('worker'), 'client unavailable')}"
+                        )
+                self._apply_retries(retry_tasks)
+                started = True
                 self.state["state"] = "running"
                 self._save()
-                jobs = [self._generate("background", "background", plan.background, plan),
-                        self._generate("foreground", "foreground", plan.foreground, plan)]
-                jobs.extend(self._generate(layer.id, "foreground", layer.prompt, plan) for layer in plan.extra_layers)
+                jobs = [
+                    self._generate("background", "background", plan.background, plan),
+                    self._generate("foreground", "foreground", plan.foreground, plan),
+                ]
+                jobs.extend(
+                    self._generate(layer.id, "foreground", layer.prompt, plan)
+                    for layer in plan.extra_layers
+                )
                 results = await asyncio.gather(*jobs, return_exceptions=True)
                 if any(isinstance(result, BaseException) for result in results):
                     self.state["state"] = "needs_attention"
@@ -234,35 +527,56 @@ class Runner:
                     raise RunError(f"Generation stopped before composition: {first}") from first
                 background, foreground, *extras = results
                 scene = self.run_dir / "scene.png"
-                await asyncio.to_thread(compose, plan, background["image"], foreground["image"], scene,
-                                        mask=foreground.get("mask"), cutout=self.config.foreground_cutout)
+                await self._local_write(
+                    compose,
+                    plan,
+                    background["image"],
+                    foreground["image"],
+                    scene,
+                    mask=foreground.get("mask"),
+                    cutout=self.config.foreground_cutout,
+                )
                 for layer, images in zip(plan.extra_layers, extras, strict=True):
                     layer_plan = plan.model_copy(update={"placement": layer.placement})
-                    await asyncio.to_thread(compose, layer_plan, scene, images["image"], scene,
-                                            mask=images.get("mask"), cutout=self.config.foreground_cutout)
+                    await self._local_write(
+                        compose,
+                        layer_plan,
+                        scene,
+                        images["image"],
+                        scene,
+                        mask=images.get("mask"),
+                        cutout=self.config.foreground_cutout,
+                    )
                 final_image = self.run_dir / "final.png"
-                await asyncio.to_thread(add_typography, scene, self.overlay, final_image)
-                self.state["tasks"]["compose"] = {"state": "completed", "outputs": {"image": "final.png"}}
+                await self._local_write(add_typography, scene, self.overlay, final_image)
+                self.state["tasks"]["compose"] = {
+                    "state": "completed",
+                    "outputs": {"image": "final.png"},
+                }
                 self.state["final_image"] = "final.png"
                 self._save()
                 if plan.video:
                     video_prompt = PromptSpec(
-                        positive_zh=plan.video.positive_zh, positive_en=plan.video.positive_en,
-                        negative=plan.video.negative, acceptance=plan.video.acceptance,
+                        positive_zh=plan.video.positive_zh,
+                        positive_en=plan.video.positive_en,
+                        negative=plan.video.negative,
+                        acceptance=plan.video.acceptance,
                     )
-                    video = (await self._generate("video", "video", video_prompt, plan, scene))["video"]
+                    video = (await self._generate("video", "video", video_prompt, plan, scene))[
+                        "video"
+                    ]
                     if plan.text_layers:
                         final_video = self.run_dir / "final.mp4"
-                        await asyncio.to_thread(overlay_video, video, self.overlay, final_video)
+                        await self._local_write(overlay_video, video, self.overlay, final_video)
                     else:
                         final_video = self.run_dir / ("final" + video.suffix)
-                        shutil.copyfile(video, final_video)
+                        await self._local_write(shutil.copyfile, video, final_video)
                     self.state["final_video"] = str(final_video.relative_to(self.run_dir))
                 self.state["state"] = "completed"
                 self._save()
                 return copy.deepcopy(self.state)
         except BaseException:
-            if hasattr(self, "state") and self.state.get("state") == "running":
+            if started and self.state.get("state") == "running":
                 self.state["state"] = "needs_attention"
                 self._save()
             raise

@@ -108,4 +108,32 @@ comfy-director run examples/poster-plan.json --config cluster.local.json --run-d
 
 网络超时不一定表示 ComfyUI 已取消任务。失败后先核对其队列和历史，再决定是否手动重跑，避免重复出图。程序只对已经拿到的素材执行后续步骤；不应根据上次运行的文件替代本次结果。
 
-画面验收仍由你或 Agent 完成。`acceptance` 不会自动触发无限重试；想修改主体、标题或视频动作时，修改相应计划内容后再执行一次明确的新任务。
+画面验收仍由你或 Agent 完成。`acceptance` 是验收清单。要生成新主体或改变视频动作时，编辑计划并使用新运行目录。
+
+## 诊断节点与依赖
+
+```bash
+comfy-director doctor --config cluster.local.json --plan examples/poster-plan.json
+```
+
+工作流检查使用各机器的 `/system_stats` 和 `/object_info`，报告节点缺失、必填输入缺失和静态选项不匹配。安装在该机器上的 checkpoint、UNet、CLIP、VAE 和 LoRA 等模型名通常由节点选项提供。工作流的自定义动态选项及运行时行为由 ComfyUI 实际提交时验证。
+
+指定计划时只检查所需角色，并检查计划涉及的本机排版和视频工具。省略计划时检查配置涉及的角色。每个所需角色至少有一个合格节点，且本地检查无错误时，`doctor` 返回退出码 0。某台机器缺项时仍会逐台报告，其他合格机器可用。
+
+## 重试已失败的任务
+
+```bash
+comfy-director run examples/poster-plan.json --config cluster.local.json \
+  --run-dir runs/poster-001 --retry foreground
+```
+
+`--retry` 接受运行记录中的任务名，如 `background`、`foreground`、附加层 `id` 或 `video`。它适用于服务器明确拒绝提交，或历史明确显示执行失败／中断的任务，重新使用该任务的输入和 seed。重复指定 `--retry` 可重试多个失败任务。保持原计划与配置，先修好节点端依赖或恢复可用机器。提交结果未知时先在原节点查队列；已知 prompt ID 的轮询超时可用同一目录直接续查。
+
+## 离线复用素材
+
+```bash
+comfy-director compose adjusted-plan.json --run-dir runs/poster-001 \
+  --font-file /path/to/font.ttc --out ./poster-adjusted.png
+```
+
+从原运行下载的背景、主前景和其他前景可直接重新合成。保留图层 ID，可改位置、尺寸、顺序和文字。图片输出放到原运行目录之外，计划如果使用普通 RGB 前景，传 `--cutout rembg` 应用本地分割模型。有 alpha 或遮罩时，用默认值即可。修改生成提示词后要重画素材时，请使用 `run` 启动新任务。

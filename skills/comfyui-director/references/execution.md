@@ -5,6 +5,7 @@
 从仓库根目录运行：
 
 ```bash
+comfy-director doctor --config cluster.local.json --plan plan.json
 comfy-director run plan.json --config cluster.local.json --run-dir runs/my-image
 ```
 
@@ -20,6 +21,13 @@ comfy-director run plan.json --config cluster.local.json --run-dir runs/my-image
 
 每次运行使用可区分的目录。根据返回的任务记录定位本次素材与最终结果，不使用“最新文件”替代任务绑定。出图失败或超时先检查队列、历史和已保存的结果，避免无依据重复提交。不要自动生成无限变体。
 
-分别报告：背景和各前景是否完成、合成图片路径、视频是否实际完成、未通过或未检查的画面要求。可选 `demo` 仅导出人工计划与报告，不生成素材，不能作为 LLM 或 GPU 联调证据。
+确认某个图层执行失败后，可在原 `run` 命令末尾加 `--retry TASK` 重试该任务，沿用原计划、配置和目录。只需调整排版或图层位置时，使用 `compose` 读取缓存素材，将新图片写到原运行目录以外。
+
+```bash
+comfy-director compose adjusted-plan.json --run-dir runs/my-image \
+  --font-file /path/to/font.ttc --out adjusted.png
+```
+
+报告背景和各前景的完成状态、合成图片路径、视频完成状态及未检查的画面要求。`demo` 导出人工计划与报告。`demo --compose` 用 Pillow 绘制演示素材并在本地合成，无需 LLM 或 GPU。
 
 执行器不提供跨机共享显存、自动故障转移或自动局部重绘。用户另有这些需求时先说明可交付的实际范围，再规划补充步骤。
